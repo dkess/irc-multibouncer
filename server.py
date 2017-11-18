@@ -9,7 +9,7 @@ import json
 import IPython
 
 UNIXPATH='s'
-IRCSERVER = 'irc.ocf.berkeley.edu'
+IRCSERVER = 'dev-irc.ocf.berkeley.edu'
 
 RETRY_WAIT = 5 # seconds
 
@@ -35,10 +35,14 @@ def validate_channel_name(chan: str) -> bool:
 
 def validate_nick(nick: str) -> bool:
     '''Enforce RFC 2812 nick name'''
-    # TODO: not strict enough
-    if ' ' in nick:
+    if nick[0].isdigit() or nick[0] == '-':
         return False
-    return True
+    allowed_chars = '_-\\[]{}^`|'
+    return all([
+        c.isalnum() or
+        c in allowed_chars
+        for c in nick
+    ])
 
 def strip_nick(fullname: str) -> str:
     return fullname.partition('!')[0]
@@ -115,15 +119,16 @@ class ChannelData:
             self.join_event.clear()
             self.leave_event.set()
 
-        self.onStateChange()
 
     def onStateChange(self):
-        if self._target_state == True and self._state == ChannelState.PARTED:
-            # first wait 0 seconds, but if that fails, wait longer
-            self._wait_join_task = asyncio.ensure_future(self.joinAfterDelay(self._wait_time))
-            self._wait_time = RETRY_WAIT
-        elif self._target_state == False and self._state == ChannelState.JOINED:
-            self.sendPart()
+        if not self._target_state:
+            if self._state == ChannelState.PARTED:
+                # first wait 0 seconds, but if that fails, wait longer
+                self._wait_join_task = asyncio.ensure_future(
+                        self.joinAfterDelay(self._wait_time))
+                self._wait_time = RETRY_WAIT
+            elif self._state == ChannelState.JOINED:
+                self.sendPart()
 
     def changeTargetState(self, newstate: bool):
         self._target_state = newstate
@@ -164,7 +169,8 @@ async def irc_loop(nick: str, sd: SessionData):
         spl = line.split(' ', 3)
         if len(spl) >= 3 and spl[1] == 'PART':
             channel = spl[2]
-            if strip_nick(line[0][1:]) == nick:
+            if strip_nick(spl[0][1:]) == nick:
+                print(sd.channels[channel]._state)
                 sd.channels[channel].changeState(ChannelState.PARTED)
 
         # KICK message
@@ -210,7 +216,10 @@ async def register(request):
         nick = j['nick']
     except:
         return web.Response(status=400)
-
+    
+    if not validate_nick(nick):
+        return web.Response(status=400, text='Invalid nick')
+    
     if nick not in sessions:
         sd = SessionData()
         sessions[nick] = sd
@@ -234,7 +243,8 @@ async def register(request):
     return web.Response(status=204)
 
 @routes.post('/join')
-async def channeljoin(request):
+@routes.post('/part')
+async def channel_join_part(request):
     try:
         j = await request.json()
         nick = j['nick']
@@ -242,7 +252,7 @@ async def channeljoin(request):
     except:
         return web.Response(status=400)
     
-    if not validate_channel_name(channel) or not validate_nick(nick):
+    if not validate_channel_name(channel):
         return web.Response(Status=400)
 
     if nick not in sessions:
@@ -250,10 +260,15 @@ async def channeljoin(request):
     sd = sessions[nick]
     await sd.event.wait()
 
-    # TODO: maybe change this to a defaultdict of some kind
-    if channel not in sd.channels:
-        sd.channels[channel] = ChannelData(channel, sd)
-        sd.channels[channel].changeTargetState(True)
+    if request.path == '/join':
+        # TODO: maybe change this to a defaultdict of some kind
+        if channel not in sd.channels:
+            sd.channels[channel] = ChannelData(channel, sd)
+        sd.channels[channel].changeTargetState(False)
+    else:
+        if channel not in sd.channels:
+            return web.Response(status=404, text='"User not in channel"')
+        sd.channels[channel].changeTargetState(False)
 
     return web.Response(status=201)
 
@@ -267,7 +282,7 @@ async def privmsg(request):
     except:
         return web.Response(status=400)
     
-    if not validate_channel_name(channel) or not validate_nick(nick):
+    if not validate_channel_name(channel):
         return web.Response(Status=400)
 
     if nick not in sessions:

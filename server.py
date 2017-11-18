@@ -6,8 +6,12 @@ from types import SimpleNamespace
 from typing import Dict, NamedTuple, Optional, Set, Tuple, Union
 import json
 
+import IPython
+
 UNIXPATH='s'
 IRCSERVER = 'irc.ocf.berkeley.edu'
+
+RETRY_WAIT = 5 # seconds
 
 def mega_decode(b):
     try:
@@ -36,6 +40,9 @@ def validate_nick(nick: str) -> bool:
         return False
     return True
 
+def strip_nick(fullname: str) -> str:
+    return fullname.partition('!')[0]
+
 class IRCError(Exception):
     def __init__(self, code: str, ircline: str) -> None:
         self.code = code
@@ -54,20 +61,11 @@ class ChannelState(Enum):
     # PART message has been sent
     PARTING = 2
 
-    # PART from the channel was received
+    # Not in channel (could also be due to kick)
     PARTED = 3
 
-    # Kicked from channel
-    KICKED = 4
-
-    # Banned from channel
-    BANNED = 5
-
-    # Joined channel despite not being instructed to
-    INVALID_JOINED = 6
-
-    # Could not join channel due to error
-    ERROR = 7
+    # Not in channel, but waiting to join
+    WAIT_JOIN = 4
 
 ChannelEvents = NamedTuple('ChannelEvents', [('join', asyncio.Event), ('leave', asyncio.Event)])
 
@@ -76,9 +74,73 @@ class SessionData:
         self.event = asyncio.Event()
         self.reader = None
         self.writer = None
-        self.channels = {}
-        self.channel_events = defaultdict(lambda: ChannelEvents(asyncio.Event(), asyncio.Event()))
+        self.channels = {} # type: Dict[str, ChannelData]
         self.error = None
+
+class ChannelData:
+    def __init__(self, name: str, session: SessionData):
+        self._state = ChannelState.PARTED
+
+        self.name = name # type: str
+
+        # True if the bot is configured to be in this channel
+        self._target_state = True # type: bool
+
+        # The IRC session associated with this channel
+        self.session = session # type: SessionData
+
+        # If waiting to join a channel, the task that will execute the join
+        self._wait_join_task = None # type: Optional[asyncio.Task]
+
+        self._wait_time = 0
+
+        # trigerred when the channel is joined
+        self.join_event = asyncio.Event()
+
+        # triggered after leaving a channel
+        self.leave_event = asyncio.Event()
+
+    def changeState(self, newstate: ChannelState):
+        oldstate = self._state
+        self._state = newstate
+
+        if oldstate == ChannelState.WAIT_JOIN and oldstate != newstate:
+            self._wait_join_task = None
+
+        if newstate == ChannelState.JOINED:
+            self._wait_time = 0
+            self.join_event.set()
+            self.leave_event.clear()
+        elif newstate == ChannelState.PARTED:
+            self.join_event.clear()
+            self.leave_event.set()
+
+        self.onStateChange()
+
+    def onStateChange(self):
+        if self._target_state == True and self._state == ChannelState.PARTED:
+            # first wait 0 seconds, but if that fails, wait longer
+            self._wait_join_task = asyncio.ensure_future(self.joinAfterDelay(self._wait_time))
+            self._wait_time = RETRY_WAIT
+        elif self._target_state == False and self._state == ChannelState.JOINED:
+            self.sendPart()
+
+    def changeTargetState(self, newstate: bool):
+        self._target_state = newstate
+
+        self.onStateChange()
+
+    async def joinAfterDelay(self, delay):
+        await asyncio.sleep(delay)
+        self.sendJoin()
+
+    def sendJoin(self):
+        self.session.writer.write('JOIN {}\r\n'.format(self.name).encode())
+        self.changeState(ChannelState.JOINING)
+
+    def sendPart(self):
+        self.session.writer.write('PART {}\r\n'.format(self.name).encode())
+        self.changeState(ChannelState.PARTING)
 
 sessions = {} # type: Dict[str, SessionData]
 
@@ -95,15 +157,33 @@ async def irc_loop(nick: str, sd: SessionData):
         spl = line.split(' ')
         if len(spl) == 3 and spl[1] == 'JOIN':
             channel = spl[2][1:]
-            if line[1:].partition('!')[0] == nick:
-                # TODO: error when joining channel
-                # TODO: getting kicked from channel
-                sd.channel_events[channel].join.set()
-                if sd.channels[channel] == ChannelState.JOINING:
-                    sd.channels[channel] = ChannelState.JOINED
-                else:
-                    sd.channels[channel] = ChannelState.INVALID_JOINED
+            if strip_nick(spl[0][1:]) == nick:
+                sd.channels[channel].changeState(ChannelState.JOINED)
+        
+        # PART message
+        spl = line.split(' ', 3)
+        if len(spl) >= 3 and spl[1] == 'PART':
+            channel = spl[2]
+            if strip_nick(line[0][1:]) == nick:
+                sd.channels[channel].changeState(ChannelState.PARTED)
 
+        # KICK message
+        spl = line.split(' ', 4)
+        if len(spl) >= 4:
+            kickee = spl[3]
+            channel = spl[2]
+            if kickee == nick:
+                sd.channels[channel].changeState(ChannelState.PARTED)
+
+        # Channel join error
+        spl = line.split(' ', 4)
+        if len(spl) >= 4:
+            # possible error messages when joining a channel
+            if spl[1] in {'474', '473', '403', '471', '475', '476', '405', '437'}:
+                errnick = spl[2]
+                channel = spl[3]
+                if errnick == nick and channel in sd.channels:
+                    sd.channels[channel].changeState(ChannelState.PARTED)
 
 async def irc_initiate(nick: str, loop: asyncio.AbstractEventLoop) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     reader, writer = await asyncio.open_connection(IRCSERVER, 6697, ssl=True, loop=loop)
@@ -170,14 +250,11 @@ async def channeljoin(request):
     sd = sessions[nick]
     await sd.event.wait()
 
+    # TODO: maybe change this to a defaultdict of some kind
     if channel not in sd.channels:
-        sd.channels[channel] = ChannelState.JOINING
-        sd.writer.write('JOIN {}\r\n'.format(channel).encode())
+        sd.channels[channel] = ChannelData(channel, sd)
+        sd.channels[channel].changeTargetState(True)
 
-    if sd.channels[channel] == ChannelState.JOINING:
-        await sd.channel_events[channel].join.wait()
-    elif sd.channels[channel] == ChannelState.INVALID_JOIN:
-        sd.channels[channel] = JOINED
     return web.Response(status=201)
 
 @routes.post('/privmsg')
@@ -197,12 +274,10 @@ async def privmsg(request):
         return web.Response(status=404, text='"User does not exist"')
     sd = sessions[nick]
 
-    await sd.event.wait()
-
-    if channel not in sd.channels or sd.channels[channel] == ChannelState.INVALID_JOINED:
+    if channel not in sd.channels:
         return web.Response(status=404, text='"Channel was not joined"')
 
-    await sd.channel_events[channel].join.wait()
+    await sd.channels[channel].join_event.wait()
 
     sd.writer.write('PRIVMSG {} :{}\r\n'.format(channel, msg).encode())
     return web.Response(status=200)

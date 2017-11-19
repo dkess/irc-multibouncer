@@ -119,16 +119,15 @@ class ChannelData:
             self.join_event.clear()
             self.leave_event.set()
 
+        self.onStateChange()
 
     def onStateChange(self):
-        if not self._target_state:
-            if self._state == ChannelState.PARTED:
-                # first wait 0 seconds, but if that fails, wait longer
-                self._wait_join_task = asyncio.ensure_future(
-                        self.joinAfterDelay(self._wait_time))
-                self._wait_time = RETRY_WAIT
-            elif self._state == ChannelState.JOINED:
-                self.sendPart()
+        if self._target_state and self._state == ChannelState.PARTED:
+            # first wait 0 seconds, but if that fails, wait longer
+            self._wait_join_task = asyncio.ensure_future(self.joinAfterDelay(self._wait_time))
+            self._wait_time = RETRY_WAIT
+        elif not self._target_state and self._state == ChannelState.JOINED:
+    	    self.sendPart()
 
     def changeTargetState(self, newstate: bool):
         self._target_state = newstate
@@ -243,6 +242,29 @@ async def register(request):
     return web.Response(status=204)
 
 @routes.post('/join')
+async def channel_join_part(request):
+    try:
+        j = await request.json()
+        nick = j['nick']
+        channel = j['channel']
+    except:
+        return web.Response(status=400)
+    
+    if not validate_channel_name(channel):
+        return web.Response(Status=400)
+
+    if nick not in sessions:
+        return web.Response(status=404, text='"User does not exist"')
+    sd = sessions[nick]
+    await sd.event.wait()
+
+    # TODO: maybe change this to a defaultdict of some kind
+    if channel not in sd.channels:
+        sd.channels[channel] = ChannelData(channel, sd)
+    sd.channels[channel].changeTargetState(True)
+
+    return web.Response(status=201)
+
 @routes.post('/part')
 async def channel_join_part(request):
     try:
@@ -260,15 +282,9 @@ async def channel_join_part(request):
     sd = sessions[nick]
     await sd.event.wait()
 
-    if request.path == '/join':
-        # TODO: maybe change this to a defaultdict of some kind
-        if channel not in sd.channels:
-            sd.channels[channel] = ChannelData(channel, sd)
-        sd.channels[channel].changeTargetState(False)
-    else:
-        if channel not in sd.channels:
-            return web.Response(status=404, text='"User not in channel"')
-        sd.channels[channel].changeTargetState(False)
+    if channel not in sd.channels:
+        return web.Response(status=404, text='"User not in channel"')
+    sd.channels[channel].changeTargetState(False)
 
     return web.Response(status=201)
 
@@ -297,8 +313,8 @@ async def privmsg(request):
     sd.writer.write('PRIVMSG {} :{}\r\n'.format(channel, msg).encode())
     return web.Response(status=200)
 
-
-loop = asyncio.get_event_loop()
+# This loop isn't doing anything but we probably want a main event loop
+#loop = asyncio.get_event_loop()
 app = web.Application()
 app.router.add_routes(routes)
 
